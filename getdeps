@@ -1,0 +1,256 @@
+#!/bin/bash
+
+set -e 
+set -o pipefail
+
+# Make files world-readable
+umask 022
+
+FLAGDIR=.depflags
+mkdir -p $FLAGDIR
+
+function debug {
+    if [ "$DEBUG" = 1 ]; then
+        carp "$@"
+    fi
+}
+
+function verbose {
+    if [ "$DEBUG" = 1 -o "$VERBOSE" = 1 ]; then
+        carp "$@"
+    fi
+}
+
+function carp {
+    echo "$@" 1>&2
+}
+
+function unpack {
+    FILE="$1"
+    DEST="$2"
+
+    if [ -z "$FILE" -o -z "$DEST" ]; then
+        carp "Internal error: Usage: unpack FILE DESTINATION"
+        return 1
+    fi
+
+    verbose "unpacking '$FILE' into '$DEST'"
+
+    CLEANUP=''
+    while true; do
+        TYPE="`file --mime -b "$FILE" | sed -e 's/.*: //; s/[;,].*//'`"
+        debug "Type of '$FILE' is '$TYPE'"
+    
+        if [ "$TYPE" = 'application/x-gzip' ]; then
+            debug "Unzipping '$FILE'"
+            NEWFILE="`mktemp -t 'unpack.XXXXXX'`"
+            CLEANUP="$CLEANUP $NEWFILE"
+            gunzip -c < "$FILE" > "$NEWFILE"
+            FILE="$NEWFILE"
+        elif [ "$TYPE" = 'application/x-tar' ]; then
+            debug "Untarring '$FILE'"
+            mkdir -p "$DEST"
+            if [ "$DEBUG" = 1 ]; then
+                V=-v
+            fi
+
+            # GNU TAR is apparently insane
+            export TAR_OPTIONS=--wildcards
+
+            cat "$FILE" | (cd "$DEST" && tar $V --strip-components $strip -x "$filter")
+            rm $CLEANUP
+            return
+        elif [ "$TYPE" = 'application/zip' -o "$TYPE" = 'application/x-zip' ]; then
+            if [ "$strip" != 0 ]; then
+                carp "there is no support for stripping paths from a zip file"
+                exit 1
+            fi
+
+            debug "Unzipping '$FILE'"
+            mkdir -p "$DEST"
+
+            (cd "$DEST"; unzip -q -o "$FILE" "$filter")
+            return
+        else
+            carp "Got unknown type '$TYPE' processing '$FILE'"
+            rm $CLEANUP
+            return
+        fi
+
+        debug "got '$NEWFILE'"
+    done
+}
+
+function sha256 {
+    openssl dgst -sha256 "$1" | cut -f2 -d' '
+}
+
+function get {
+    URL="$1"; shift
+    DEST="$1"; shift
+    SHA256="$1"; shift
+    CURRENT_DEPENDENCY_TIMESTAMP=`timeOfFile "$CURRENT_DEPENDENCY_SCRIPT"`
+
+    if [ -z "$URL" -o -z "$DEST" -o -z "$SHA256" ]; then
+        carp "Usage: get URL DEST EXPECTED_SHA256"
+        exit 1
+    fi
+
+    strip=0
+    filter='*'
+    filename=''
+    unpack=yes
+    while [ -n "$1" ]; do
+        if echo "$1" | egrep -q "^(strip|filter|filename|unpack)="; then
+            eval "$1"
+        else
+            carp "$1" is not valid
+            exit 1
+        fi
+        shift
+    done
+    
+    if [ -z "$filename" ]; then
+        FILE="`basename "$URL"`"
+    else
+        FILE="$filename"
+    fi
+
+    if [ -z "$CACHE_DIR" ]; then
+        CACHE_DIR=~/.olbcache
+    fi
+
+    if [ ! -d "$CACHE_DIR" ]; then
+        mkdir -p "$CACHE_DIR"
+    fi
+
+    HASHED="`echo $SHA256 | sed -e 's!\(..\)\(..\)\(.*\)!\1/\2/&!'`"
+
+    if [ ! -d "$CACHE_DIR/$HASHED" ]; then
+        mkdir -p "$CACHE_DIR/$HASHED"
+    fi
+
+    FULLPATH="$CACHE_DIR/$HASHED/$FILE"
+
+    EXISTINGSHA256=''
+    if [ -f "$FULLPATH" ]; then
+        EXISTINGSHA256="`sha256 "$FULLPATH"`"
+    fi
+
+    if [ ! -f "$FULLPATH" -o ! "$EXISTINGSHA256" = "$SHA256" ]; then
+        verbose "fetching '$URL'"
+        TMPNAME="`mktemp -t fetch.XXXXXX`"
+
+        # --insecure is okay here, since we're otherwise validating checksums, and presumably the 
+        # developer checking in the checksum actually validated that the package is the right one. 
+        # It would be awesome not to do this, but CentOS certificate stores are woefully out of 
+        # date and nobody's manually updating them, and certainly not on the old build server.
+        curl --insecure -sSL "$URL" -o "$TMPNAME"
+
+        if [ ! -f "$TMPNAME" ]; then
+            carp "Failed to download '$FILE'!"
+            exit 1
+        fi
+        
+
+        RECVDSHA256="`sha256 "$TMPNAME"`"
+        debug "Got checksum '$RECVDSHA256', expecting '$SHA256'"
+
+        if [ "$RECVDSHA256" != "$SHA256" ]; then
+            rm "$TMPNAME"
+            echo "Checksum mismatch for '$FILE'. Got '$RECVDSHA256' expected '$SHA256'" 1>&2
+            exit 1
+        else
+            mv "$TMPNAME" "$FULLPATH"
+        fi
+    else
+        debug "'$FILE' already exists with checksum '$SHA256'"
+    fi
+
+    FLAGBASE="$FLAGDIR/`basename "$FULLPATH"`.time=$CURRENT_DEPENDENCY_TIMESTAMP.dest=`echo $DEST | sed -e 's@/@_@g'`"
+
+    if [ "$filter" != "*" ]; then
+        FLAGBASE="$FLAGBASE.filter=`echo $filter | sed -e 's#/#_#g'`"
+    fi
+    if [ "$strip" != 0 ]; then
+        FLAGBASE="$FLAGBASE.strip=$strip"
+    fi
+    FLAG="$FLAGBASE.timestamp"
+
+    if [ "$FORCE" != 1 ]; then
+        debug "checking $FLAG"
+    fi
+
+    if [ "$FORCE" = 1 -o "$FULLPATH" -nt "$FLAG" -o "$FULLPATH" -ot "$FLAG" ]; then
+        if [ "$unpack" = "yes" ]; then
+            rm -f "$DEST"/.patched*
+            unpack "$FULLPATH" "$DEST"
+        else
+            verbose "copying '$FULLPATH' to '$DEST'"
+
+            DIR="`dirname "$DEST"`"
+
+            mkdir -p "$DIR"
+            cat "$FULLPATH" > "$DEST"
+        fi
+
+        touch -r "$FULLPATH" "$FLAG"
+    else
+        verbose "$URL is already up to date, skipping"
+    fi
+}
+
+function usage {
+        carp "Usage: $0 [-v] [-f] dependencyfile..."
+        exit 1
+}
+
+function timeOfFile {
+    if [ `uname -s` = Darwin ]; then
+        stat -f "%m" "$1"
+    else
+        stat --format='%Y' "$1"
+    fi
+}
+
+function apply-patch {
+    if [ -z "$1" -o -z "$2" ]; then
+        carp "apply-patch requires a patch file and destination"
+        exit 1
+    fi
+
+    patchflag=.patched-"`basename "$1"`"
+
+    if [ -e "$2"/"$patchflag" ]; then
+        verbose "Already patched with '$1'"
+        return 0;
+    fi
+
+    patch -p0 < "$1" && touch "$2"/"$patchflag"
+}
+
+while [ -n "$1" ]; do
+    case "$1" in
+    -v) 
+        VERBOSE=1
+        ;;
+    -f)
+        FORCE=1
+        ;;
+    -*) 
+        usage
+        ;;
+    *)
+        FILES="$FILES $1"
+        ;;
+    esac
+    shift
+done
+
+for CURRENT_DEPENDENCY_SCRIPT in $FILES; do 
+    . "$CURRENT_DEPENDENCY_SCRIPT"
+done
+
+if [ -z "$FILES" ]; then
+    usage
+fi
